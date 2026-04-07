@@ -8,3 +8,15 @@ build-*
 *.a
 *.so.*
 thirdparty/libzip-1.1.1
+
+# CMake / 编译数据库（生成文件，勿提交）
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+
+# 编辑器 / 语言服务
+.clangd
+.cache/
+
+# 本地数据集（体积大，自备）
+data/

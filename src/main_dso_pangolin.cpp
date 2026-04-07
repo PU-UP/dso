@@ -46,8 +46,9 @@
 #include "FullSystem/PixelSelector2.h"
 
 
-
+#if HAS_PANGOLIN
 #include "IOWrapper/Pangolin/PangolinDSOViewer.h"
+#endif
 #include "IOWrapper/OutputWrapper/SampleOutputWrapper.h"
 
 
@@ -400,12 +401,17 @@ int main( int argc, char** argv )
 
 
 
+#if HAS_PANGOLIN
     IOWrap::PangolinDSOViewer* viewer = 0;
 	if(!disableAllDisplay)
     {
         viewer = new IOWrap::PangolinDSOViewer(wG[0],hG[0], false);
         fullSystem->outputWrapper.push_back(viewer);
     }
+#else
+    if(!disableAllDisplay)
+        printf("WARNING: Pangolin not found at build time; running without GUI / 3D display.\n");
+#endif
 
 
 
@@ -564,8 +570,10 @@ int main( int argc, char** argv )
     });
 
 
+#if HAS_PANGOLIN
     if(viewer != 0)
         viewer->run();
+#endif
 
     runthread.join();
 
