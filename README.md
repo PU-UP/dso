@@ -74,6 +74,18 @@ make -j4
 - 终端示例输出：`sampleoutput=1`。
 - **有 Pangolin 窗口时快捷键**（需先**点击窗口获得焦点**）：**`P` 或空格** 暂停/继续；**`Q` 或 `Esc`** 正常退出（关闭窗口后处理线程会结束并写出 `result.txt` 等，再退出进程）。
 
+## 辅助脚本
+
+### 可视化运行器（推荐）
+
+在 `scripts/run_dso_gui.py` 提供一个 Tkinter GUI，用于选择数据路径、`mode/preset`、以及 `times.txt` 曝光策略，并一键启动 `build/bin/dso_dataset`：
+
+```bash
+python scripts/run_dso_gui.py
+```
+
+- DSO 会在**当前工作目录**写出 `result.txt`；GUI 中可选择输出目录，或选择“不保留 result.txt”（在临时目录运行）。 
+
 标定与全部参数以原项目及源码为准；ROS 示例见 [dso_ros](https://github.com/JakobEngel/dso_ros)。
 
 ## 许可
