@@ -86,6 +86,8 @@ private:
 	void drawConstraints();
 
 	boost::thread runThread;
+	bool runThreadLaunched;
+	bool pangolinMainWindowOpen;
 	bool running;
 	int w,h;
 

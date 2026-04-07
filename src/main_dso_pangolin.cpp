@@ -44,6 +44,7 @@
 #include "FullSystem/FullSystem.h"
 #include "OptimizationBackend/MatrixAccumulators.h"
 #include "FullSystem/PixelSelector2.h"
+#include "util/PlaybackControl.h"
 
 
 #if HAS_PANGOLIN
@@ -460,6 +461,12 @@ int main( int argc, char** argv )
 
         for(int ii=0;ii<(int)idsToPlay.size(); ii++)
         {
+            while(g_dsoPlaybackPaused.load(std::memory_order_relaxed) &&
+                  !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
+                usleep(10000);
+            if(g_dsoUserQuitRequested.load(std::memory_order_relaxed))
+                break;
+
             if(!fullSystem->initialized)	// if not initialized: reset start time.
             {
                 gettimeofday(&tv_start, NULL);
@@ -485,7 +492,20 @@ int main( int argc, char** argv )
                 double sSinceStart = sInitializerOffset + ((tv_now.tv_sec-tv_start.tv_sec) + (tv_now.tv_usec-tv_start.tv_usec)/(1000.0f*1000.0f));
 
                 if(sSinceStart < timesToPlayAt[ii])
-                    usleep((int)((timesToPlayAt[ii]-sSinceStart)*1000*1000));
+                {
+                    double waitSec = timesToPlayAt[ii] - sSinceStart;
+                    while(waitSec > 0.0 && !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
+                    {
+                        while(g_dsoPlaybackPaused.load(std::memory_order_relaxed) &&
+                              !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
+                            usleep(10000);
+                        if(g_dsoUserQuitRequested.load(std::memory_order_relaxed))
+                            break;
+                        double step = waitSec > 0.02 ? 0.02 : waitSec;
+                        usleep((int)(step * 1000 * 1000));
+                        waitSec -= step;
+                    }
+                }
                 else if(sSinceStart > timesToPlayAt[ii]+0.5+0.1*(ii%2))
                 {
                     printf("SKIPFRAME %d (play at %f, now it is %f)!\n", ii, timesToPlayAt[ii], sSinceStart);
@@ -493,12 +513,13 @@ int main( int argc, char** argv )
                 }
             }
 
-
+            if(g_dsoUserQuitRequested.load(std::memory_order_relaxed))
+            {
+                delete img;
+                break;
+            }
 
             if(!skipFrame) fullSystem->addActiveFrame(img, i);
-
-
-
 
             delete img;
 

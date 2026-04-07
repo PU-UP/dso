@@ -52,9 +52,9 @@ make -j4
 
 ## 运行（数据放在 `data/`）
 
-数据格式与 [TUM mono 数据集](https://vision.in.tum.de/mono-dataset) 一致：`files=` 指向**图像目录**或 `**images.zip`**（字母序），并配合 `calib=` 等。
+数据格式与 [TUM mono 数据集](https://vision.in.tum.de/mono-dataset) 一致：`files=` 指向**图像目录**或 **`images.zip`**（字母序），并配合 `calib=` 等。
 
-在 `**build/**` 目录下示例：
+在 **`build/`** 目录下示例：
 
 ```bash
 ./bin/dso_dataset \
@@ -72,6 +72,7 @@ make -j4
 - 无光度标定时用 `mode=1` 或 `mode=2`（见 `src/main_dso_pangolin.cpp`）。
 - 无 GUI / 未编 Pangolin 时加 `nogui=1`。
 - 终端示例输出：`sampleoutput=1`。
+- **有 Pangolin 窗口时快捷键**（需先**点击窗口获得焦点**）：**`P` 或空格** 暂停/继续；**`Q` 或 `Esc`** 正常退出（关闭窗口后处理线程会结束并写出 `result.txt` 等，再退出进程）。
 
 标定与全部参数以原项目及源码为准；ROS 示例见 [dso_ros](https://github.com/JakobEngel/dso_ros)。
 

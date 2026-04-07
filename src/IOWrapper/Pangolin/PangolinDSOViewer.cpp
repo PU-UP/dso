@@ -26,6 +26,25 @@
 #include "PangolinDSOViewer.h"
 #include "KeyFrameDisplay.h"
 
+#include <cstdio>
+
+#include "util/PlaybackControl.h"
+
+namespace {
+void dsoTogglePlaybackPause()
+{
+	bool v = !dso::g_dsoPlaybackPaused.load();
+	dso::g_dsoPlaybackPaused.store(v);
+	printf("%s\n", v ? "[dso_dataset] Paused (P or Space to resume)" : "[dso_dataset] Resumed");
+}
+
+void dsoRequestQuit()
+{
+	dso::g_dsoUserQuitRequested.store(true);
+	pangolin::Quit();
+}
+} // namespace
+
 #include "util/settings.h"
 #include "util/globalCalib.h"
 #include "FullSystem/HessianBlocks.h"
@@ -44,6 +63,7 @@ PangolinDSOViewer::PangolinDSOViewer(int w, int h, bool startRunThread)
 	this->w = w;
 	this->h = h;
 	running=true;
+	pangolinMainWindowOpen = false;
 
 
 	{
@@ -65,9 +85,12 @@ PangolinDSOViewer::PangolinDSOViewer(int w, int h, bool startRunThread)
 
 	needReset = false;
 
-
+	runThreadLaunched = false;
     if(startRunThread)
+    {
         runThread = boost::thread(&PangolinDSOViewer::run, this);
+        runThreadLaunched = true;
+    }
 
 }
 
@@ -75,7 +98,13 @@ PangolinDSOViewer::PangolinDSOViewer(int w, int h, bool startRunThread)
 PangolinDSOViewer::~PangolinDSOViewer()
 {
 	close();
-	runThread.join();
+	if(runThreadLaunched)
+		runThread.join();
+	if(pangolinMainWindowOpen)
+	{
+		pangolin::DestroyWindow("Main");
+		pangolinMainWindowOpen = false;
+	}
 }
 
 
@@ -84,6 +113,7 @@ void PangolinDSOViewer::run()
 	printf("START PANGOLIN!\n");
 
 	pangolin::CreateWindowAndBind("Main",2*w,2*h);
+	pangolinMainWindowOpen = true;
 	const int UI_WIDTH = 180;
 
 	glEnable(GL_DEPTH_TEST);
@@ -162,6 +192,13 @@ void PangolinDSOViewer::run()
 	pangolin::Var<double> settings_trackFps("ui.Track fps",0,0,0,false);
 	pangolin::Var<double> settings_mapFps("ui.KF fps",0,0,0,false);
 
+	printf("[dso_dataset] Keys: P / Space = pause or resume, Q / Esc = quit (focus Pangolin window)\n");
+	pangolin::RegisterKeyPressCallback('p', dsoTogglePlaybackPause);
+	pangolin::RegisterKeyPressCallback('P', dsoTogglePlaybackPause);
+	pangolin::RegisterKeyPressCallback(' ', dsoTogglePlaybackPause);
+	pangolin::RegisterKeyPressCallback('q', dsoRequestQuit);
+	pangolin::RegisterKeyPressCallback('Q', dsoRequestQuit);
+	pangolin::RegisterKeyPressCallback(pangolin::PANGO_KEY_ESCAPE, dsoRequestQuit);
 
 	// Default hooks for exiting (Esc) and fullscreen (tab).
 	while( !pangolin::ShouldQuit() && running )
@@ -287,12 +324,6 @@ void PangolinDSOViewer::run()
 
 	    if(needReset) reset_internal();
 	}
-
-
-	printf("QUIT Pangolin thread!\n");
-	printf("I'll just kill the whole process.\nSo Long, and Thanks for All the Fish!\n");
-
-	exit(1);
 }
 
 
@@ -303,8 +334,10 @@ void PangolinDSOViewer::close()
 
 void PangolinDSOViewer::join()
 {
-	runThread.join();
-	printf("JOINED Pangolin thread!\n");
+	if(runThreadLaunched)
+		runThread.join();
+	if(runThreadLaunched)
+		printf("JOINED Pangolin thread!\n");
 }
 
 void PangolinDSOViewer::reset()

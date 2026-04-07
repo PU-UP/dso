@@ -25,12 +25,11 @@ endif()
 
 # optional libraries
 find_package(LibZip QUIET)
-find_package(Pangolin 0.2 QUIET)
 
-# Bundled Pangolin when system package is missing (thirdparty/Pangolin)
+# Pangolin: 优先用 thirdparty（子模块），避免 find_package 误判为已找到但系统实际未安装 libpangolin（链接报 -lpangolin 找不到）
 set(DSO_PANGOLIN_TARGET "")
-if(NOT Pangolin_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/thirdparty/Pangolin/CMakeLists.txt")
-	message("--- no system Pangolin; building bundled thirdparty/Pangolin.")
+if(EXISTS "${PROJECT_SOURCE_DIR}/thirdparty/Pangolin/CMakeLists.txt")
+	message("--- using bundled thirdparty/Pangolin.")
 	set(BUILD_TESTS OFF CACHE BOOL "DSO: skip Pangolin tests" FORCE)
 	set(BUILD_TOOLS OFF CACHE BOOL "DSO: skip Pangolin tools" FORCE)
 	set(BUILD_EXAMPLES OFF CACHE BOOL "DSO: skip Pangolin examples" FORCE)
@@ -38,6 +37,8 @@ if(NOT Pangolin_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/thirdparty/Pangolin/CMak
 	add_subdirectory("${PROJECT_SOURCE_DIR}/thirdparty/Pangolin" "${CMAKE_BINARY_DIR}/thirdparty_pangolin")
 	set(Pangolin_FOUND TRUE)
 	set(DSO_PANGOLIN_TARGET pangolin)
+else()
+	find_package(Pangolin 0.2 QUIET)
 endif()
 
 find_package(OpenCV QUIET)
@@ -73,6 +74,7 @@ set(dso_SOURCE_FILES
   ${PROJECT_SOURCE_DIR}/src/util/settings.cpp
   ${PROJECT_SOURCE_DIR}/src/util/Undistort.cpp
   ${PROJECT_SOURCE_DIR}/src/util/globalCalib.cpp
+  ${PROJECT_SOURCE_DIR}/src/util/PlaybackControl.cpp
 )
 
 
