@@ -24,17 +24,23 @@
 
 
 #include <thread>
-#include <locale.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <stdio.h>
+#include <atomic>
+#include <cmath>
+#include <csignal>
+#include <cstdio>
+#include <ctime>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <memory>
+#include <string>
+#include <vector>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "IOWrapper/Output3DWrapper.h"
 #include "IOWrapper/ImageDisplay.h"
 
-
-#include <boost/thread.hpp>
 #include "util/settings.h"
 #include "util/globalFuncs.h"
 #include "util/DatasetReader.h"
@@ -52,54 +58,408 @@
 #endif
 #include "IOWrapper/OutputWrapper/SampleOutputWrapper.h"
 
-
-std::string vignette = "";
-std::string gammaCalib = "";
-std::string source = "";
-std::string calib = "";
-double rescale = 1;
-bool reverse = false;
-bool disableROS = false;
-int start=0;
-int end=100000;
-bool prefetch = false;
-float playbackSpeed=0;	// 0 for linearize (play as fast as possible, while sequentializing tracking & mapping). otherwise, factor on timestamps.
-bool preload=false;
-bool useSampleOutput=false;
+namespace dso {
+namespace IOWrap {
+class PangolinDSOViewer;
+}  // namespace IOWrap
+}  // namespace dso
 
 
-int mode=0;
+namespace {
 
-bool firstRosSpin=false;
+struct Options {
+	std::string vignette;
+	std::string gamma_calib;
+	std::string source;
+	std::string calib;
+
+	double rescale = 1.0;  // kept for CLI compatibility (unused in this file)
+	bool reverse = false;
+	int start_index = 0;
+	int end_index = 100000;
+	bool prefetch = false;  // kept for CLI compatibility (unused in this file)
+	double playback_speed = 0.0;  // 0 => play as fast as possible
+	bool preload = false;
+	bool use_sample_output = false;
+
+	int mode = 0;
+};
 
 using namespace dso;
 
+struct PlaybackPlan {
+	std::vector<int> ids;
+	std::vector<double> times_to_play_at;
+};
 
-void my_exit_handler(int s)
-{
-	printf("Caught signal %d\n",s);
-	exit(1);
+struct PlaybackStats {
+	int processed_frame_count = 0;
+	int first_processed_id = -1;
+	int last_processed_id = -1;
+	clock_t started = 0;
+	clock_t ended = 0;
+	struct timeval tv_start = {};
+	struct timeval tv_end = {};
+	double initializer_offset_sec = 0.0;
+};
+
+void SigIntHandler(int /*signum*/) {
+	g_dsoUserQuitRequested.store(true, std::memory_order_relaxed);
 }
 
-void exitThread()
-{
-	struct sigaction sigIntHandler;
-	sigIntHandler.sa_handler = my_exit_handler;
-	sigemptyset(&sigIntHandler.sa_mask);
-	sigIntHandler.sa_flags = 0;
-	sigaction(SIGINT, &sigIntHandler, NULL);
+void InstallSigIntHandlerOrDie() {
+	struct sigaction sa;
+	std::memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = SigIntHandler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	if (sigaction(SIGINT, &sa, nullptr) != 0) {
+		std::perror("sigaction(SIGINT) failed");
+		std::exit(1);
+	}
+}
 
-	firstRosSpin=true;
-	while(true) pause();
+void ApplyModeSettings(int mode) {
+	if (mode == 0) {
+		printf("PHOTOMETRIC MODE WITH CALIBRATION!\n");
+		return;
+	}
+	if (mode == 1) {
+		printf("PHOTOMETRIC MODE WITHOUT CALIBRATION!\n");
+		setting_photometricCalibration = 0;
+		setting_affineOptModeA = 0;  // -1: fix. >=0: optimize (with prior, if > 0).
+		setting_affineOptModeB = 0;  // -1: fix. >=0: optimize (with prior, if > 0).
+		return;
+	}
+	if (mode == 2) {
+		printf("PHOTOMETRIC MODE WITH PERFECT IMAGES!\n");
+		setting_photometricCalibration = 0;
+		setting_affineOptModeA = -1;  // -1: fix. >=0: optimize (with prior, if > 0).
+		setting_affineOptModeB = -1;  // -1: fix. >=0: optimize (with prior, if > 0).
+		setting_minGradHistAdd = 3;
+		return;
+	}
+	printf("UNKNOWN mode=%d (keeping defaults)\n", mode);
+}
+
+std::unique_ptr<ImageFolderReader> CreateReaderOrDie(const Options& options) {
+	std::unique_ptr<ImageFolderReader> reader(new ImageFolderReader(
+			options.source, options.calib, options.gamma_calib, options.vignette));
+	reader->setGlobalCalibration();
+
+	if (setting_photometricCalibration > 0 && reader->getPhotometricGamma() == 0) {
+		printf("ERROR: dont't have photometric calibation. Need to use commandline options mode=1 or mode=2 ");
+		std::exit(1);
+	}
+
+	return reader;
+}
+
+void AttachOutputs(FullSystem* full_system,
+                   const std::vector<std::unique_ptr<IOWrap::Output3DWrapper>>& outputs) {
+	full_system->outputWrapper.clear();
+	full_system->outputWrapper.reserve(outputs.size());
+	for (const auto& ow : outputs) {
+		full_system->outputWrapper.push_back(ow.get());
+	}
+}
+
+std::vector<std::unique_ptr<IOWrap::Output3DWrapper>> CreateOutputs(
+		const Options& options,
+		IOWrap::PangolinDSOViewer** viewer_out) {
+	std::vector<std::unique_ptr<IOWrap::Output3DWrapper>> outputs;
+	outputs.reserve(4);
+
+#if HAS_PANGOLIN
+	*viewer_out = nullptr;
+	if (!disableAllDisplay) {
+		std::unique_ptr<IOWrap::PangolinDSOViewer> v(
+				new IOWrap::PangolinDSOViewer(wG[0], hG[0], false));
+		*viewer_out = v.get();
+		outputs.emplace_back(std::move(v));
+	}
+#else
+	(void)viewer_out;
+	if (!disableAllDisplay) {
+		printf("WARNING: Pangolin not found at build time; running without GUI / 3D display.\n");
+	}
+#endif
+
+	if (options.use_sample_output) {
+		outputs.emplace_back(new IOWrap::SampleOutputWrapper());
+	}
+
+	return outputs;
+}
+
+std::unique_ptr<FullSystem> CreateFullSystem(
+		ImageFolderReader& reader,
+		const Options& options,
+		const std::vector<std::unique_ptr<IOWrap::Output3DWrapper>>& outputs) {
+	std::unique_ptr<FullSystem> full_system(new FullSystem());
+	full_system->setGammaFunction(reader.getPhotometricGamma());
+	full_system->linearizeOperation = (options.playback_speed == 0.0);
+	AttachOutputs(full_system.get(), outputs);
+	return full_system;
+}
+
+PlaybackPlan BuildPlaybackPlan(ImageFolderReader& reader, const Options& options) {
+	PlaybackPlan plan;
+
+	const int num_images = reader.getNumImages();
+	int first_index = options.start_index;
+	int last_index_exclusive = options.end_index;
+	int index_step = 1;
+	if (options.reverse) {
+		printf("REVERSE!!!!");
+		first_index = options.end_index - 1;
+		if (first_index >= num_images) {
+			first_index = num_images - 1;
+		}
+		last_index_exclusive = options.start_index;
+		index_step = -1;
+	}
+
+	for (int i = first_index;
+	     i >= 0 && i < num_images && index_step * i < index_step * last_index_exclusive;
+	     i += index_step) {
+		plan.ids.push_back(i);
+	}
+
+	if (plan.ids.empty() || options.playback_speed <= 0.0) {
+		return plan;
+	}
+
+	plan.times_to_play_at.reserve(plan.ids.size());
+	plan.times_to_play_at.push_back(0.0);
+	for (size_t k = 1; k < plan.ids.size(); ++k) {
+		const double ts_this = reader.getTimestamp(plan.ids[k]);
+		const double ts_prev = reader.getTimestamp(plan.ids[k - 1]);
+		plan.times_to_play_at.push_back(
+				plan.times_to_play_at.back() + std::fabs(ts_this - ts_prev) / options.playback_speed);
+	}
+
+	return plan;
+}
+
+bool WaitUntilCanProcessNextFrame() {
+	while (g_dsoPlaybackPaused.load(std::memory_order_relaxed) &&
+	       !g_dsoPlaybackStepRequested.load(std::memory_order_relaxed) &&
+	       !g_dsoUserQuitRequested.load(std::memory_order_relaxed)) {
+		usleep(10000);
+	}
+	return !g_dsoUserQuitRequested.load(std::memory_order_relaxed);
+}
+
+void ConsumeStepRequest() {
+	(void)g_dsoPlaybackStepRequested.exchange(false, std::memory_order_relaxed);
+}
+
+void MaybeResetStartTiming(FullSystem* full_system,
+                           const PlaybackPlan& plan,
+                           size_t idx,
+                           PlaybackStats* stats) {
+	if (full_system->initialized) {
+		return;
+	}
+	gettimeofday(&stats->tv_start, NULL);
+	stats->started = clock();
+	stats->initializer_offset_sec = plan.times_to_play_at.empty() ? 0.0 : plan.times_to_play_at[idx];
+}
+
+bool ShouldSkipFrameByPacing(const Options& options,
+                             const PlaybackPlan& plan,
+                             size_t idx,
+                             const PlaybackStats& stats) {
+	if (options.playback_speed <= 0.0 || plan.times_to_play_at.empty()) {
+		return false;
+	}
+
+	struct timeval tv_now;
+	gettimeofday(&tv_now, NULL);
+	const double since_start_sec =
+			stats.initializer_offset_sec +
+			((tv_now.tv_sec - stats.tv_start.tv_sec) +
+			 (tv_now.tv_usec - stats.tv_start.tv_usec) / (1000.0f * 1000.0f));
+
+	if (since_start_sec < plan.times_to_play_at[idx]) {
+		double wait_sec = plan.times_to_play_at[idx] - since_start_sec;
+		while (wait_sec > 0.0 && !g_dsoUserQuitRequested.load(std::memory_order_relaxed)) {
+			if (!WaitUntilCanProcessNextFrame()) {
+				break;
+			}
+			if (g_dsoPlaybackStepRequested.load(std::memory_order_relaxed)) {
+				break;
+			}
+			const double step = (wait_sec > 0.02) ? 0.02 : wait_sec;
+			usleep(static_cast<int>(step * 1000 * 1000));
+			wait_sec -= step;
+		}
+		return false;
+	}
+
+	if (since_start_sec > plan.times_to_play_at[idx] + 0.5 + 0.1 * (idx % 2)) {
+		printf("SKIPFRAME %zu (play at %f, now it is %f)!\n", idx, plan.times_to_play_at[idx],
+		       since_start_sec);
+		return true;
+	}
+
+	return false;
+}
+
+void PrintAndLogStatsIfAvailable(ImageFolderReader& reader, const PlaybackStats& stats) {
+	if (stats.processed_frame_count <= 0 || stats.first_processed_id < 0 || stats.last_processed_id < 0) {
+		return;
+	}
+
+	const double seconds_processed = std::fabs(reader.getTimestamp(stats.first_processed_id) -
+	                                           reader.getTimestamp(stats.last_processed_id));
+	const double ms_taken_single =
+			1000.0f * (stats.ended - stats.started) / static_cast<double>(CLOCKS_PER_SEC);
+	const double ms_taken_mt =
+			stats.initializer_offset_sec +
+			((stats.tv_end.tv_sec - stats.tv_start.tv_sec) * 1000.0f +
+			 (stats.tv_end.tv_usec - stats.tv_start.tv_usec) / (1000.0f));
+
+	const double fps = (seconds_processed > 1e-9) ? (stats.processed_frame_count / seconds_processed) : 0.0;
+
+	printf("\n======================"
+	       "\n%d Frames (%.1f fps)"
+	       "\n%.2fms per frame (single core); "
+	       "\n%.2fms per frame (multi core); "
+	       "\n%.3fx (single core); "
+	       "\n%.3fx (multi core); "
+	       "\n======================\n\n",
+	       stats.processed_frame_count, fps,
+	       ms_taken_single / stats.processed_frame_count,
+	       ms_taken_mt / stats.processed_frame_count,
+	       (seconds_processed > 1e-9) ? (1000.0 / (ms_taken_single / seconds_processed)) : 0.0,
+	       (seconds_processed > 1e-9) ? (1000.0 / (ms_taken_mt / seconds_processed)) : 0.0);
+
+	if (!setting_logStuff) {
+		return;
+	}
+
+	std::ofstream tmlog;
+	tmlog.open("logs/time.txt", std::ios::trunc | std::ios::out);
+	tmlog << 1000.0f * (stats.ended - stats.started) /
+				 (float)(CLOCKS_PER_SEC * reader.getNumImages()) << " "
+	      << ((stats.tv_end.tv_sec - stats.tv_start.tv_sec) * 1000.0f +
+	          (stats.tv_end.tv_usec - stats.tv_start.tv_usec) / 1000.0f) /
+				 (float)reader.getNumImages() << "\n";
+	tmlog.flush();
+	tmlog.close();
+}
+
+void RunPlaybackLoop(ImageFolderReader* reader,
+                     const Options& options,
+                     const std::vector<std::unique_ptr<IOWrap::Output3DWrapper>>& outputs,
+                     std::unique_ptr<FullSystem>* full_system) {
+	const PlaybackPlan plan = BuildPlaybackPlan(*reader, options);
+	if (plan.ids.empty()) {
+		printf("No frames to play. Check start/end/files.\n");
+		g_dsoUserQuitRequested.store(true, std::memory_order_relaxed);
+		return;
+	}
+
+	std::vector<std::unique_ptr<ImageAndExposure>> preloaded_images;
+	if (options.preload) {
+		printf("LOADING ALL IMAGES!\n");
+		preloaded_images.reserve(plan.ids.size());
+		for (int id : plan.ids) {
+			preloaded_images.emplace_back(reader->getImage(id));
+		}
+	}
+
+	PlaybackStats stats;
+	gettimeofday(&stats.tv_start, NULL);
+	stats.started = clock();
+
+	auto ResetFullSystem = [&]() {
+		printf("RESETTING!\n");
+		for (const auto& ow : outputs) {
+			ow->reset();
+		}
+
+		full_system->reset(new FullSystem());
+		(*full_system)->setGammaFunction(reader->getPhotometricGamma());
+		(*full_system)->linearizeOperation = (options.playback_speed == 0.0);
+		AttachOutputs(full_system->get(), outputs);
+		setting_fullResetRequested = false;
+	};
+
+	for (size_t ii = 0; ii < plan.ids.size(); ++ii) {
+		if (!WaitUntilCanProcessNextFrame()) {
+			break;
+		}
+		ConsumeStepRequest();
+		MaybeResetStartTiming(full_system->get(), plan, ii, &stats);
+
+		const int id = plan.ids[ii];
+
+		std::unique_ptr<ImageAndExposure> img;
+		if (options.preload) {
+			img = std::move(preloaded_images[ii]);
+		} else {
+			img.reset(reader->getImage(id));
+		}
+
+		const bool skip_frame = ShouldSkipFrameByPacing(options, plan, ii, stats);
+		if (g_dsoUserQuitRequested.load(std::memory_order_relaxed)) {
+			break;
+		}
+
+		if (!skip_frame) {
+			(*full_system)->addActiveFrame(img.get(), id);
+			++stats.processed_frame_count;
+			if (stats.first_processed_id < 0) {
+				stats.first_processed_id = id;
+			}
+			stats.last_processed_id = id;
+		}
+		img.reset();
+
+		if ((*full_system)->initFailed || setting_fullResetRequested) {
+			if (ii < 250 || setting_fullResetRequested) {
+				ResetFullSystem();
+			}
+		}
+
+		if ((*full_system)->isLost) {
+			printf("LOST!!\n");
+			break;
+		}
+	}
+
+	(*full_system)->blockUntilMappingIsFinished();
+	stats.ended = clock();
+	gettimeofday(&stats.tv_end, NULL);
+
+	(*full_system)->printResult("result.txt");
+	PrintAndLogStatsIfAvailable(*reader, stats);
+}
+
+void RunGuiIfEnabled(IOWrap::PangolinDSOViewer* viewer) {
+#if HAS_PANGOLIN
+	if (viewer != nullptr) {
+		viewer->run();
+	}
+#else
+	(void)viewer;
+#endif
+}
+
+void ShutdownOutputs(std::vector<std::unique_ptr<IOWrap::Output3DWrapper>>* outputs) {
+	for (auto& ow : *outputs) {
+		ow->join();
+	}
+	outputs->clear();
 }
 
 
-
-void settingsDefault(int preset)
-{
+void ApplyPresetSettings(int preset, Options* options) {
 	printf("\n=============== PRESET Settings: ===============\n");
-	if(preset == 0 || preset == 1)
-	{
+	if (preset == 0 || preset == 1) {
 		printf("DEFAULT settings:\n"
 				"- %s real-time enforcing\n"
 				"- 2000 active points\n"
@@ -107,8 +467,8 @@ void settingsDefault(int preset)
 				"- 1-6 LM iteration each KF\n"
 				"- original image resolution\n", preset==0 ? "no " : "1x");
 
-		playbackSpeed = (preset==0 ? 0 : 1);
-		preload = preset==1;
+		options->playback_speed = (preset==0 ? 0 : 1);
+		options->preload = preset==1;
 		setting_desiredImmatureDensity = 1500;
 		setting_desiredPointDensity = 2000;
 		setting_minFrames = 5;
@@ -119,8 +479,7 @@ void settingsDefault(int preset)
 		setting_logStuff = false;
 	}
 
-	if(preset == 2 || preset == 3)
-	{
+	if (preset == 2 || preset == 3) {
 		printf("FAST settings:\n"
 				"- %s real-time enforcing\n"
 				"- 800 active points\n"
@@ -128,8 +487,8 @@ void settingsDefault(int preset)
 				"- 1-4 LM iteration each KF\n"
 				"- 424 x 320 image resolution\n", preset==0 ? "no " : "5x");
 
-		playbackSpeed = (preset==2 ? 0 : 5);
-		preload = preset==3;
+		options->playback_speed = (preset==2 ? 0 : 5);
+		options->preload = preset==3;
 		setting_desiredImmatureDensity = 600;
 		setting_desiredPointDensity = 800;
 		setting_minFrames = 4;
@@ -151,475 +510,198 @@ void settingsDefault(int preset)
 
 
 
-void parseArgument(char* arg)
-{
-	int option;
-	float foption;
+bool ParseArgument(const char* arg, Options* options) {
+	int option_int = 0;
+	float option_float = 0.0f;
 	char buf[1000];
 
-
-    if(1==sscanf(arg,"sampleoutput=%d",&option))
-    {
-        if(option==1)
-        {
-            useSampleOutput = true;
-            printf("USING SAMPLE OUTPUT WRAPPER!\n");
-        }
-        return;
-    }
-
-    if(1==sscanf(arg,"quiet=%d",&option))
-    {
-        if(option==1)
-        {
-            setting_debugout_runquiet = true;
-            printf("QUIET MODE, I'll shut up!\n");
-        }
-        return;
-    }
-
-	if(1==sscanf(arg,"preset=%d",&option))
-	{
-		settingsDefault(option);
-		return;
+	if (1 == sscanf(arg, "sampleoutput=%d", &option_int)) {
+		if (option_int == 1) {
+			options->use_sample_output = true;
+			printf("USING SAMPLE OUTPUT WRAPPER!\n");
+		}
+		return true;
 	}
 
+	if (1 == sscanf(arg, "quiet=%d", &option_int)) {
+		if (option_int == 1) {
+			setting_debugout_runquiet = true;
+			printf("QUIET MODE, I'll shut up!\n");
+		}
+		return true;
+	}
 
-	if(1==sscanf(arg,"rec=%d",&option))
-	{
-		if(option==0)
-		{
+	if (1 == sscanf(arg, "preset=%d", &option_int)) {
+		ApplyPresetSettings(option_int, options);
+		return true;
+	}
+
+	if (1 == sscanf(arg, "rec=%d", &option_int)) {
+		if (option_int == 0) {
 			disableReconfigure = true;
 			printf("DISABLE RECONFIGURE!\n");
 		}
-		return;
+		return true;
 	}
 
-
-
-	if(1==sscanf(arg,"noros=%d",&option))
-	{
-		if(option==1)
-		{
-			disableROS = true;
+	if (1 == sscanf(arg, "noros=%d", &option_int)) {
+		if (option_int == 1) {
 			disableReconfigure = true;
 			printf("DISABLE ROS (AND RECONFIGURE)!\n");
 		}
-		return;
+		return true;
 	}
 
-	if(1==sscanf(arg,"nolog=%d",&option))
-	{
-		if(option==1)
-		{
+	if (1 == sscanf(arg, "nolog=%d", &option_int)) {
+		if (option_int == 1) {
 			setting_logStuff = false;
 			printf("DISABLE LOGGING!\n");
 		}
-		return;
+		return true;
 	}
-	if(1==sscanf(arg,"reverse=%d",&option))
-	{
-		if(option==1)
-		{
-			reverse = true;
+
+	if (1 == sscanf(arg, "reverse=%d", &option_int)) {
+		if (option_int == 1) {
+			options->reverse = true;
 			printf("REVERSE!\n");
 		}
-		return;
+		return true;
 	}
-	if(1==sscanf(arg,"nogui=%d",&option))
-	{
-		if(option==1)
-		{
+
+	if (1 == sscanf(arg, "nogui=%d", &option_int)) {
+		if (option_int == 1) {
 			disableAllDisplay = true;
 			printf("NO GUI!\n");
 		}
-		return;
+		return true;
 	}
-	if(1==sscanf(arg,"nomt=%d",&option))
-	{
-		if(option==1)
-		{
+
+	if (1 == sscanf(arg, "nomt=%d", &option_int)) {
+		if (option_int == 1) {
 			multiThreading = false;
 			printf("NO MultiThreading!\n");
 		}
-		return;
+		return true;
 	}
-	if(1==sscanf(arg,"prefetch=%d",&option))
-	{
-		if(option==1)
-		{
-			prefetch = true;
+
+	if (1 == sscanf(arg, "prefetch=%d", &option_int)) {
+		if (option_int == 1) {
+			options->prefetch = true;
 			printf("PREFETCH!\n");
 		}
-		return;
-	}
-	if(1==sscanf(arg,"start=%d",&option))
-	{
-		start = option;
-		printf("START AT %d!\n",start);
-		return;
-	}
-	if(1==sscanf(arg,"end=%d",&option))
-	{
-		end = option;
-		printf("END AT %d!\n",start);
-		return;
+		return true;
 	}
 
-	if(1==sscanf(arg,"files=%s",buf))
-	{
-		source = buf;
-		printf("loading data from %s!\n", source.c_str());
-		return;
+	if (1 == sscanf(arg, "start=%d", &option_int)) {
+		options->start_index = option_int;
+		printf("START AT %d!\n", options->start_index);
+		return true;
 	}
 
-	if(1==sscanf(arg,"calib=%s",buf))
-	{
-		calib = buf;
-		printf("loading calibration from %s!\n", calib.c_str());
-		return;
+	if (1 == sscanf(arg, "end=%d", &option_int)) {
+		options->end_index = option_int;
+		printf("END AT %d!\n", options->end_index);
+		return true;
 	}
 
-	if(1==sscanf(arg,"vignette=%s",buf))
-	{
-		vignette = buf;
-		printf("loading vignette from %s!\n", vignette.c_str());
-		return;
+	if (1 == sscanf(arg, "files=%s", buf)) {
+		options->source = buf;
+		printf("loading data from %s!\n", options->source.c_str());
+		return true;
 	}
 
-	if(1==sscanf(arg,"gamma=%s",buf))
-	{
-		gammaCalib = buf;
-		printf("loading gammaCalib from %s!\n", gammaCalib.c_str());
-		return;
+	if (1 == sscanf(arg, "calib=%s", buf)) {
+		options->calib = buf;
+		printf("loading calibration from %s!\n", options->calib.c_str());
+		return true;
 	}
 
-	if(1==sscanf(arg,"rescale=%f",&foption))
-	{
-		rescale = foption;
-		printf("RESCALE %f!\n", rescale);
-		return;
+	if (1 == sscanf(arg, "vignette=%s", buf)) {
+		options->vignette = buf;
+		printf("loading vignette from %s!\n", options->vignette.c_str());
+		return true;
 	}
 
-	if(1==sscanf(arg,"speed=%f",&foption))
-	{
-		playbackSpeed = foption;
-		printf("PLAYBACK SPEED %f!\n", playbackSpeed);
-		return;
+	if (1 == sscanf(arg, "gamma=%s", buf)) {
+		options->gamma_calib = buf;
+		printf("loading gammaCalib from %s!\n", options->gamma_calib.c_str());
+		return true;
 	}
 
-	if(1==sscanf(arg,"save=%d",&option))
-	{
-		if(option==1)
-		{
+	if (1 == sscanf(arg, "rescale=%f", &option_float)) {
+		options->rescale = option_float;
+		printf("RESCALE %f!\n", options->rescale);
+		return true;
+	}
+
+	if (1 == sscanf(arg, "speed=%f", &option_float)) {
+		options->playback_speed = option_float;
+		printf("PLAYBACK SPEED %f!\n", options->playback_speed);
+		return true;
+	}
+
+	if (1 == sscanf(arg, "save=%d", &option_int)) {
+		if (option_int == 1) {
 			debugSaveImages = true;
-			if(42==system("rm -rf images_out")) printf("system call returned 42 - what are the odds?. This is only here to shut up the compiler.\n");
-			if(42==system("mkdir images_out")) printf("system call returned 42 - what are the odds?. This is only here to shut up the compiler.\n");
-			if(42==system("rm -rf images_out")) printf("system call returned 42 - what are the odds?. This is only here to shut up the compiler.\n");
-			if(42==system("mkdir images_out")) printf("system call returned 42 - what are the odds?. This is only here to shut up the compiler.\n");
+			const int rm_ret = std::system("rm -rf images_out");
+			const int mkdir_ret = std::system("mkdir -p images_out");
+			(void)rm_ret;
+			(void)mkdir_ret;
 			printf("SAVE IMAGES!\n");
 		}
-		return;
+		return true;
 	}
 
-	if(1==sscanf(arg,"mode=%d",&option))
-	{
-
-		mode = option;
-		if(option==0)
-		{
-			printf("PHOTOMETRIC MODE WITH CALIBRATION!\n");
-		}
-		if(option==1)
-		{
-			printf("PHOTOMETRIC MODE WITHOUT CALIBRATION!\n");
-			setting_photometricCalibration = 0;
-			setting_affineOptModeA = 0; //-1: fix. >=0: optimize (with prior, if > 0).
-			setting_affineOptModeB = 0; //-1: fix. >=0: optimize (with prior, if > 0).
-		}
-		if(option==2)
-		{
-			printf("PHOTOMETRIC MODE WITH PERFECT IMAGES!\n");
-			setting_photometricCalibration = 0;
-			setting_affineOptModeA = -1; //-1: fix. >=0: optimize (with prior, if > 0).
-			setting_affineOptModeB = -1; //-1: fix. >=0: optimize (with prior, if > 0).
-            setting_minGradHistAdd=3;
-		}
-		return;
+	if (1 == sscanf(arg, "mode=%d", &option_int)) {
+		options->mode = option_int;
+		ApplyModeSettings(option_int);
+		return true;
 	}
 
-	printf("could not parse argument \"%s\"!!!!\n", arg);
+	return false;
 }
 
-
-
-int main( int argc, char** argv )
-{
-	//setlocale(LC_ALL, "");
-	for(int i=1; i<argc;i++)
-		parseArgument(argv[i]);
-
-	// hook crtl+C.
-	boost::thread exThread = boost::thread(exitThread);
-
-
-	ImageFolderReader* reader = new ImageFolderReader(source,calib, gammaCalib, vignette);
-	reader->setGlobalCalibration();
-
-
-
-	if(setting_photometricCalibration > 0 && reader->getPhotometricGamma() == 0)
-	{
-		printf("ERROR: dont't have photometric calibation. Need to use commandline options mode=1 or mode=2 ");
-		exit(1);
+Options ParseArgsOrDie(int argc, char** argv) {
+	Options options;
+	for (int i = 1; i < argc; ++i) {
+		if (!ParseArgument(argv[i], &options)) {
+			printf("could not parse argument \"%s\"!!!!\n", argv[i]);
+		}
 	}
+	return options;
+}
+
+}  // namespace
 
 
 
+int main(int argc, char** argv) {
+	const Options options = ParseArgsOrDie(argc, argv);
+	InstallSigIntHandlerOrDie();
 
-	int lstart=start;
-	int lend = end;
-	int linc = 1;
-	if(reverse)
-	{
-		printf("REVERSE!!!!");
-		lstart=end-1;
-		if(lstart >= reader->getNumImages())
-			lstart = reader->getNumImages()-1;
-		lend = start;
-		linc = -1;
-	}
+	std::unique_ptr<ImageFolderReader> reader = CreateReaderOrDie(options);
 
+	IOWrap::PangolinDSOViewer* viewer = nullptr;
+	std::vector<std::unique_ptr<IOWrap::Output3DWrapper>> outputs =
+			CreateOutputs(options, &viewer);
 
+	std::unique_ptr<FullSystem> full_system = CreateFullSystem(*reader, options, outputs);
 
-	FullSystem* fullSystem = new FullSystem();
-	fullSystem->setGammaFunction(reader->getPhotometricGamma());
-	fullSystem->linearizeOperation = (playbackSpeed==0);
+	// to make MacOS happy: run this in dedicated thread -- and use this one to run the GUI.
+	std::thread playback_thread([&]() {
+		RunPlaybackLoop(reader.get(), options, outputs, &full_system);
+	});
 
+	RunGuiIfEnabled(viewer);
+	playback_thread.join();
 
-
-
-
-
-
-#if HAS_PANGOLIN
-    IOWrap::PangolinDSOViewer* viewer = 0;
-	if(!disableAllDisplay)
-    {
-        viewer = new IOWrap::PangolinDSOViewer(wG[0],hG[0], false);
-        fullSystem->outputWrapper.push_back(viewer);
-    }
-#else
-    if(!disableAllDisplay)
-        printf("WARNING: Pangolin not found at build time; running without GUI / 3D display.\n");
-#endif
-
-
-
-    if(useSampleOutput)
-        fullSystem->outputWrapper.push_back(new IOWrap::SampleOutputWrapper());
-
-
-
-
-    // to make MacOS happy: run this in dedicated thread -- and use this one to run the GUI.
-    std::thread runthread([&]() {
-        std::vector<int> idsToPlay;
-        std::vector<double> timesToPlayAt;
-        for(int i=lstart;i>= 0 && i< reader->getNumImages() && linc*i < linc*lend;i+=linc)
-        {
-            idsToPlay.push_back(i);
-            if(timesToPlayAt.size() == 0)
-            {
-                timesToPlayAt.push_back((double)0);
-            }
-            else
-            {
-                double tsThis = reader->getTimestamp(idsToPlay[idsToPlay.size()-1]);
-                double tsPrev = reader->getTimestamp(idsToPlay[idsToPlay.size()-2]);
-                timesToPlayAt.push_back(timesToPlayAt.back() +  fabs(tsThis-tsPrev)/playbackSpeed);
-            }
-        }
-
-
-        std::vector<ImageAndExposure*> preloadedImages;
-        if(preload)
-        {
-            printf("LOADING ALL IMAGES!\n");
-            for(int ii=0;ii<(int)idsToPlay.size(); ii++)
-            {
-                int i = idsToPlay[ii];
-                preloadedImages.push_back(reader->getImage(i));
-            }
-        }
-
-        struct timeval tv_start;
-        gettimeofday(&tv_start, NULL);
-        clock_t started = clock();
-        double sInitializerOffset=0;
-
-
-        for(int ii=0;ii<(int)idsToPlay.size(); ii++)
-        {
-            while(g_dsoPlaybackPaused.load(std::memory_order_relaxed) &&
-                  !g_dsoPlaybackStepRequested.load(std::memory_order_relaxed) &&
-                  !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
-                usleep(10000);
-            if(g_dsoUserQuitRequested.load(std::memory_order_relaxed))
-                break;
-
-            // 如果是单步放行，消费掉 step 请求，确保只处理一帧后回到“暂停等待”。
-            (void)g_dsoPlaybackStepRequested.exchange(false, std::memory_order_relaxed);
-
-            if(!fullSystem->initialized)	// if not initialized: reset start time.
-            {
-                gettimeofday(&tv_start, NULL);
-                started = clock();
-                sInitializerOffset = timesToPlayAt[ii];
-            }
-
-            int i = idsToPlay[ii];
-
-
-            ImageAndExposure* img;
-            if(preload)
-                img = preloadedImages[ii];
-            else
-                img = reader->getImage(i);
-
-
-
-            bool skipFrame=false;
-            if(playbackSpeed!=0)
-            {
-                struct timeval tv_now; gettimeofday(&tv_now, NULL);
-                double sSinceStart = sInitializerOffset + ((tv_now.tv_sec-tv_start.tv_sec) + (tv_now.tv_usec-tv_start.tv_usec)/(1000.0f*1000.0f));
-
-                if(sSinceStart < timesToPlayAt[ii])
-                {
-                    double waitSec = timesToPlayAt[ii] - sSinceStart;
-                    while(waitSec > 0.0 && !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
-                    {
-                        while(g_dsoPlaybackPaused.load(std::memory_order_relaxed) &&
-                              !g_dsoPlaybackStepRequested.load(std::memory_order_relaxed) &&
-                              !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
-                            usleep(10000);
-                        if(g_dsoUserQuitRequested.load(std::memory_order_relaxed))
-                            break;
-
-                        // 单步时，跳过时间等待，立即处理这一帧。
-                        if(g_dsoPlaybackStepRequested.load(std::memory_order_relaxed))
-                            break;
-                        double step = waitSec > 0.02 ? 0.02 : waitSec;
-                        usleep((int)(step * 1000 * 1000));
-                        waitSec -= step;
-                    }
-                }
-                else if(sSinceStart > timesToPlayAt[ii]+0.5+0.1*(ii%2))
-                {
-                    printf("SKIPFRAME %d (play at %f, now it is %f)!\n", ii, timesToPlayAt[ii], sSinceStart);
-                    skipFrame=true;
-                }
-            }
-
-            if(g_dsoUserQuitRequested.load(std::memory_order_relaxed))
-            {
-                delete img;
-                break;
-            }
-
-            if(!skipFrame) fullSystem->addActiveFrame(img, i);
-
-            delete img;
-
-            if(fullSystem->initFailed || setting_fullResetRequested)
-            {
-                if(ii < 250 || setting_fullResetRequested)
-                {
-                    printf("RESETTING!\n");
-
-                    std::vector<IOWrap::Output3DWrapper*> wraps = fullSystem->outputWrapper;
-                    delete fullSystem;
-
-                    for(IOWrap::Output3DWrapper* ow : wraps) ow->reset();
-
-                    fullSystem = new FullSystem();
-                    fullSystem->setGammaFunction(reader->getPhotometricGamma());
-                    fullSystem->linearizeOperation = (playbackSpeed==0);
-
-
-                    fullSystem->outputWrapper = wraps;
-
-                    setting_fullResetRequested=false;
-                }
-            }
-
-            if(fullSystem->isLost)
-            {
-                    printf("LOST!!\n");
-                    break;
-            }
-
-        }
-        fullSystem->blockUntilMappingIsFinished();
-        clock_t ended = clock();
-        struct timeval tv_end;
-        gettimeofday(&tv_end, NULL);
-
-
-        fullSystem->printResult("result.txt");
-
-
-        int numFramesProcessed = abs(idsToPlay[0]-idsToPlay.back());
-        double numSecondsProcessed = fabs(reader->getTimestamp(idsToPlay[0])-reader->getTimestamp(idsToPlay.back()));
-        double MilliSecondsTakenSingle = 1000.0f*(ended-started)/(float)(CLOCKS_PER_SEC);
-        double MilliSecondsTakenMT = sInitializerOffset + ((tv_end.tv_sec-tv_start.tv_sec)*1000.0f + (tv_end.tv_usec-tv_start.tv_usec)/1000.0f);
-        printf("\n======================"
-                "\n%d Frames (%.1f fps)"
-                "\n%.2fms per frame (single core); "
-                "\n%.2fms per frame (multi core); "
-                "\n%.3fx (single core); "
-                "\n%.3fx (multi core); "
-                "\n======================\n\n",
-                numFramesProcessed, numFramesProcessed/numSecondsProcessed,
-                MilliSecondsTakenSingle/numFramesProcessed,
-                MilliSecondsTakenMT / (float)numFramesProcessed,
-                1000 / (MilliSecondsTakenSingle/numSecondsProcessed),
-                1000 / (MilliSecondsTakenMT / numSecondsProcessed));
-        //fullSystem->printFrameLifetimes();
-        if(setting_logStuff)
-        {
-            std::ofstream tmlog;
-            tmlog.open("logs/time.txt", std::ios::trunc | std::ios::out);
-            tmlog << 1000.0f*(ended-started)/(float)(CLOCKS_PER_SEC*reader->getNumImages()) << " "
-                  << ((tv_end.tv_sec-tv_start.tv_sec)*1000.0f + (tv_end.tv_usec-tv_start.tv_usec)/1000.0f) / (float)reader->getNumImages() << "\n";
-            tmlog.flush();
-            tmlog.close();
-        }
-
-    });
-
-
-#if HAS_PANGOLIN
-    if(viewer != 0)
-        viewer->run();
-#endif
-
-    runthread.join();
-
-	for(IOWrap::Output3DWrapper* ow : fullSystem->outputWrapper)
-	{
-		ow->join();
-		delete ow;
-	}
-
-
+	ShutdownOutputs(&outputs);
 
 	printf("DELETE FULLSYSTEM!\n");
-	delete fullSystem;
+	full_system.reset();
 
 	printf("DELETE READER!\n");
-	delete reader;
+	reader.reset();
 
 	printf("EXIT NOW!\n");
 	return 0;
