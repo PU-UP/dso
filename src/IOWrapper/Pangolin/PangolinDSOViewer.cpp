@@ -38,6 +38,18 @@ void dsoTogglePlaybackPause()
 	printf("%s\n", v ? "[dso_dataset] Paused (P or Space to resume)" : "[dso_dataset] Resumed");
 }
 
+void dsoStepPlaybackOnce()
+{
+	// 单步更符合“暂停状态下放行一帧”的语义：若当前未暂停，则先进入暂停再放行一帧。
+	if(!dso::g_dsoPlaybackPaused.load())
+	{
+		dso::g_dsoPlaybackPaused.store(true);
+		printf("[dso_dataset] Paused for stepping.\n");
+	}
+	dso::g_dsoPlaybackStepRequested.store(true);
+	printf("[dso_dataset] Step requested (N).\n");
+}
+
 void dsoRequestQuit()
 {
 	dso::g_dsoUserQuitRequested.store(true);
@@ -192,10 +204,12 @@ void PangolinDSOViewer::run()
 	pangolin::Var<double> settings_trackFps("ui.Track fps",0,0,0,false);
 	pangolin::Var<double> settings_mapFps("ui.KF fps",0,0,0,false);
 
-	printf("[dso_dataset] Keys: P / Space = pause or resume, Q / Esc = quit (focus Pangolin window)\n");
+	printf("[dso_dataset] Keys: P / Space = pause or resume, N = step (next image), Q / Esc = quit (focus Pangolin window)\n");
 	pangolin::RegisterKeyPressCallback('p', dsoTogglePlaybackPause);
 	pangolin::RegisterKeyPressCallback('P', dsoTogglePlaybackPause);
 	pangolin::RegisterKeyPressCallback(' ', dsoTogglePlaybackPause);
+	pangolin::RegisterKeyPressCallback('n', dsoStepPlaybackOnce);
+	pangolin::RegisterKeyPressCallback('N', dsoStepPlaybackOnce);
 	pangolin::RegisterKeyPressCallback('q', dsoRequestQuit);
 	pangolin::RegisterKeyPressCallback('Q', dsoRequestQuit);
 	pangolin::RegisterKeyPressCallback(pangolin::PANGO_KEY_ESCAPE, dsoRequestQuit);

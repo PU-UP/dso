@@ -462,10 +462,14 @@ int main( int argc, char** argv )
         for(int ii=0;ii<(int)idsToPlay.size(); ii++)
         {
             while(g_dsoPlaybackPaused.load(std::memory_order_relaxed) &&
+                  !g_dsoPlaybackStepRequested.load(std::memory_order_relaxed) &&
                   !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
                 usleep(10000);
             if(g_dsoUserQuitRequested.load(std::memory_order_relaxed))
                 break;
+
+            // 如果是单步放行，消费掉 step 请求，确保只处理一帧后回到“暂停等待”。
+            (void)g_dsoPlaybackStepRequested.exchange(false, std::memory_order_relaxed);
 
             if(!fullSystem->initialized)	// if not initialized: reset start time.
             {
@@ -497,9 +501,14 @@ int main( int argc, char** argv )
                     while(waitSec > 0.0 && !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
                     {
                         while(g_dsoPlaybackPaused.load(std::memory_order_relaxed) &&
+                              !g_dsoPlaybackStepRequested.load(std::memory_order_relaxed) &&
                               !g_dsoUserQuitRequested.load(std::memory_order_relaxed))
                             usleep(10000);
                         if(g_dsoUserQuitRequested.load(std::memory_order_relaxed))
+                            break;
+
+                        // 单步时，跳过时间等待，立即处理这一帧。
+                        if(g_dsoPlaybackStepRequested.load(std::memory_order_relaxed))
                             break;
                         double step = waitSec > 0.02 ? 0.02 : waitSec;
                         usleep((int)(step * 1000 * 1000));
